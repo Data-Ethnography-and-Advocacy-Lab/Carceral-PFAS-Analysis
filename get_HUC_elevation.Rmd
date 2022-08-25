@@ -1,0 +1,179 @@
+---
+title: "Get HUC-12 Codes and Elevations for All Point Sources"
+author: Lindsay Poirier
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+The purpose of the code presented in this document is to compose the final datasets that will be used to analyze carceral facility proximity to potential PFAS sites. Towards this end, the code:
+
+1. Loads source datasets and transforms them to a common CRS (4269)
+2. Determines which watershed boundary (HUC-12) each facility in the source datasets geo-spatially intersect with
+3. Determines the elevation of each facility in the source datasets via the USGS Elevation Point Query Service
+4. Saves all new datasets as .gpkg files for use in HUC_analysis.Rmd
+
+> Notes: New files are saved often throughout the code to prevent having to re-execute computationally heavy areas should RStudio get hung up. All files that are unnecessary for HUC_analysis.Rmd are unlinked eventually. 
+
+## Load Packages
+
+```{r}
+library(tidyverse)
+library(sf)
+library(rgeos)
+library(readxl)
+library(elevatr)
+```
+
+## Load Source Datasets
+
+### Carceral Facilities
+
+> Source: Department of Homeland Security. "Prison Boundaries." Homeland Infrastructure Foundation Level Data, July 7, 2020. [https://hifld-geoplatform.opendata.arcgis.com/datasets/geoplatform::prison-boundaries/about](https://hifld-geoplatform.opendata.arcgis.com/datasets/geoplatform::prison-boundaries/about)
+
+```{r}
+pb_sf <- st_read("source_datasets/Prison_Boundaries-shp/Prison_Boundaries.shp") %>%
+  st_transform(crs = 4269) %>%
+  st_transform(crs = 32617) %>% #convert to utm for calculating centroids
+  st_centroid() %>% #centroids from original multipolygons
+  st_transform(crs = 4269) #back to 4269
+```
+
+```{r}
+susp_cont <- read_csv("source_datasets/suspected_contamination_220712.csv") %>%
+  select(-1) %>%
+  rename(Index = X) %>%
+  st_as_sf(coords=c("Longitude","Latitude"), crs = 4326) %>%
+  st_transform(crs = 4269) #back to 4269
+```
+
+### PFAS
+
+```{r}
+pfas_sf <- read.csv("source_datasets/pfas.csv")  %>%
+  filter(!is.na(latitude) | !is.na(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, na.fail = FALSE) %>%
+  st_transform(4269)
+```
+
+## Summaries of facility totals
+
+### How many facilities were analyzed in each category?
+
+This code block produces a table listing the number of facilities that were analyzed in each category.
+
+```{r}
+susp_cont %>%
+  st_drop_geometry() %>%
+  group_by(Source) %>%
+  summarize(Count = n())
+```
+
+### How many carceral facilities were not open or missing population data?
+
+The Department of Homeland Security extracts information about facility operating statuses, capacities, and current populations from city, county, and state websites and documents. That data is missing from this dataset if it hasn't been recorded via these sources. 
+
+```{r}
+pb_sf %>%
+  st_set_geometry(NULL) %>%
+  summarize(num_not_closed = sum(STATUS != "CLOSED"),
+            percent_not_closed = sum(STATUS != "CLOSED") / n() * 100,
+            num_missing_pop = sum(POPULATION == -999),
+            percent_missing_pop = sum(POPULATION == -999) / n() * 100)
+  
+```
+
+## Get HUC-12s Boundary Codes and Elevations for Each Point Source
+
+> The HUC-12 Watershed Boundary Dataset is not included in the GitHub repo due to size (102992 rows). It can be accessed at [https://water.usgs.gov/GIS/huc.html](https://water.usgs.gov/GIS/huc.html)
+
+```{r}
+wbd <- st_read("source_datasets/WBD_National_GDB/WBD_National_GDB.gdb/")
+check_validity <- st_is_valid(wbd)
+
+#When we ran this analysis, ten points from the watershed boundary file had invalid geometry. We used functions from the sf package to make the geometries valid. 
+
+wbd_valid <- st_make_valid(wbd)
+rm(wbd)
+
+st_write(wbd_valid, "source_datasets/wbd_valid.gpkg")
+```
+
+For each point source, we first determined where point locations intersected with watershed boundaries. We added the corresponding HUC-12 code to the point source data. Then, using the elevatr package (which streamlines access to the USGS Elevation Point Query Service API), we determined the elevations for each facility. 
+
+### Get HUC and Elevation for Carceral Facilities
+
+```{r}
+intersected_pb_wbd <- st_intersects(pb_sf, wbd_valid)
+
+huc_pb_sf <- pb_sf %>%
+  mutate(intersection = as.integer(intersected_pb_wbd),
+         HUC = if_else(is.na(intersection), "",
+                        wbd_valid$huc12[intersection]))
+
+elevation_pb <- get_elev_point(huc_pb_sf, prj = 4269, src = "epqs")
+
+st_write(elevation_pb, "huc_elevation_datasets/pb_HUC_elevation.gpkg")
+rm(pb_sf, intersected_pb_wbd, huc_pb_sf)
+```
+### Get HUC and Elevation for Suspected Sites
+
+```{r}
+intersected_susp_cont_wbd <- 
+  st_intersects(susp_cont, wbd_valid)
+
+huc_susp_cont_sf <- 
+  susp_cont %>%
+  mutate(intersection = as.integer(intersected_susp_cont_wbd),
+         HUC = if_else(is.na(intersection), "",
+                        wbd_valid$huc12[intersection]))
+
+#Elevation API requests are handled in chunks to avoid timeouts.
+
+get_elev <- function(data){
+  
+  row_num <- data %>% 
+    st_drop_geometry() %>%
+    slice(1) %>% 
+    select(Index) %>% 
+    pull()
+  
+  print(paste("Collecting elevation for data starting at row", row_num))
+  
+  elevation_susp_cont_x <- 
+    get_elev_point(data, 
+                   prj = 4269, 
+                   src = "epqs")
+}
+
+n <-  5000 
+
+huc_susp_cont_sf_sliced <- 
+  huc_susp_cont_sf %>% 
+  group_by(row_number() %/% n) %>% 
+  group_map(~ .x)
+
+elevation_susp_cont <- 
+  map_dfr(huc_susp_cont_sf_sliced, 
+          get_elev)
+
+st_write(elevation_susp_cont, "huc_elevation_datasets/susp_cont_HUC_elevation.gpkg")
+
+rm(susp_cont, intersected_susp_cont_wbd, huc_susp_cont_sf_sliced, huc_susp_cont_sf)
+```
+### Get HUC and Elevation for PFAS Sites
+
+```{r}
+intersected_pfas_wbd <- st_intersects(pfas_sf, wbd_valid)
+
+huc_pfas_sf <- pfas_sf %>%
+  mutate(intersection = as.integer(intersected_pfas_wbd),
+         HUC = if_else(is.na(intersection), "",
+                        wbd_valid$huc12[intersection]))
+
+elevation_pfas <- get_elev_point(huc_pfas_sf, prj = 4269, src = "epqs")
+
+st_write(elevation_pfas, "huc_elevation_datasets/pfas_HUC_elevation.gpkg")
+rm(pfas_sf, intersected_pfas_wbd, huc_pfas_sf)
+```
